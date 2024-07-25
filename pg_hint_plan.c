@@ -233,6 +233,14 @@ typedef enum HintStatus
 								 * it) */
 } HintStatus;
 
+#define PMAGIC	(123456789)
+typedef struct ParsedName
+{
+	int		magic;
+	char   *name;
+	bool	in_quote;
+} ParsedName;
+
 #define hint_state_enabled(hint) ((hint)->base.state == HINT_STATE_NOTUSED || \
 								  (hint)->base.state == HINT_STATE_USED)
 
@@ -271,7 +279,7 @@ struct Hint
 typedef struct ScanMethodHint
 {
 	Hint			base;
-	char		   *relname;
+	ParsedName	   *relname;
 	List		   *indexnames;
 	bool			regexp;
 	unsigned char	enforce_mask;
@@ -295,7 +303,7 @@ typedef struct JoinMethodHint
 	Hint			base;
 	int				nrels;
 	int				inner_nrels;
-	char		  **relnames;
+	ParsedName	  **relnames;
 	unsigned char	enforce_mask;
 	Relids			joinrelids;
 	Relids			inner_joinrelids;
@@ -304,8 +312,8 @@ typedef struct JoinMethodHint
 /* join order hints */
 typedef struct OuterInnerRels
 {
-	char   *relation;
-	List   *outer_inner_pair;
+	ParsedName	   *relation;
+	List		   *outer_inner_pair;
 } OuterInnerRels;
 
 typedef struct LeadingHint
@@ -336,7 +344,7 @@ typedef struct RowsHint
 	Hint			base;
 	int				nrels;
 	int				inner_nrels;
-	char		  **relnames;
+	ParsedName	  **relnames;
 	Relids			joinrelids;
 	Relids			inner_joinrelids;
 	char		   *rows_str;
@@ -348,7 +356,7 @@ typedef struct RowsHint
 typedef struct ParallelHint
 {
 	Hint			base;
-	char		   *relname;
+	ParsedName	   *relname;
 	char		   *nworkers_str;	/* original string of nworkers */
 	int				nworkers;		/* num of workers specified by Worker */
 	bool			force_parallel;	/* force parallel scan */
@@ -483,7 +491,7 @@ static Hint *MemoizeHintCreate(const char *hint_str, const char *keyword,
 static void quote_value(StringInfo buf, const char *value);
 
 static const char *parse_quoted_value(const char *str, char **word,
-									  bool truncate);
+									  bool truncate, bool *in_quote);
 
 RelOptInfo *pg_hint_plan_standard_join_search(PlannerInfo *root,
 											  int levels_needed,
@@ -1196,11 +1204,15 @@ ScanMethodHintDesc(ScanMethodHint *hint, StringInfo buf, bool nolf)
 	appendStringInfo(buf, "%s(", hint->base.keyword);
 	if (hint->relname != NULL)
 	{
-		quote_value(buf, hint->relname);
+		quote_value(buf, hint->relname->name);
 		foreach(l, hint->indexnames)
 		{
+			ParsedName *pname = (ParsedName *) lfirst(l);
+
+			Assert(pname->magic == PMAGIC);
+
 			appendStringInfoCharMacro(buf, ' ');
-			quote_value(buf, (char *) lfirst(l));
+			quote_value(buf, pname->name);
 		}
 	}
 	appendStringInfoString(buf, ")");
@@ -1216,11 +1228,11 @@ JoinMethodHintDesc(JoinMethodHint *hint, StringInfo buf, bool nolf)
 	appendStringInfo(buf, "%s(", hint->base.keyword);
 	if (hint->relnames != NULL)
 	{
-		quote_value(buf, hint->relnames[0]);
+		quote_value(buf, hint->relnames[0]->name);
 		for (i = 1; i < hint->nrels; i++)
 		{
 			appendStringInfoCharMacro(buf, ' ');
-			quote_value(buf, hint->relnames[i]);
+			quote_value(buf, hint->relnames[i]->name);
 		}
 	}
 	appendStringInfoString(buf, ")");
@@ -1252,7 +1264,17 @@ OuterInnerDesc(OuterInnerRels *outer_inner, StringInfo buf)
 		appendStringInfoCharMacro(buf, ')');
 	}
 	else
-		quote_value(buf, outer_inner->relation);
+		quote_value(buf, outer_inner->relation->name);
+}
+
+static char *
+_relname(void *value)
+{
+	ParsedName *parse = (ParsedName *) value;
+
+	Assert(parse->magic == PMAGIC && parse->name != NULL);
+
+	return parse->name;
 }
 
 static void
@@ -1268,12 +1290,13 @@ LeadingHintDesc(LeadingHint *hint, StringInfo buf, bool nolf)
 
 		foreach(l, hint->relations)
 		{
+			char *relname = _relname(lfirst(l));
 			if (is_first)
 				is_first = false;
 			else
 				appendStringInfoCharMacro(buf, ' ');
 
-			quote_value(buf, (char *) lfirst(l));
+			quote_value(buf, relname);
 		}
 	}
 	else
@@ -1298,7 +1321,7 @@ SetHintDesc(SetHint *hint, StringInfo buf, bool nolf)
 		else
 			appendStringInfoCharMacro(buf, ' ');
 
-		quote_value(buf, (char *) lfirst(l));
+		quote_value(buf, (char *) _relname(lfirst(l)));
 	}
 	appendStringInfo(buf, ")");
 	if (!nolf)
@@ -1313,11 +1336,13 @@ RowsHintDesc(RowsHint *hint, StringInfo buf, bool nolf)
 	appendStringInfo(buf, "%s(", hint->base.keyword);
 	if (hint->relnames != NULL)
 	{
-		quote_value(buf, hint->relnames[0]);
+		Assert(hint->relnames[0]->magic == PMAGIC);
+		quote_value(buf, hint->relnames[0]->name);
 		for (i = 1; i < hint->nrels; i++)
 		{
 			appendStringInfoCharMacro(buf, ' ');
-			quote_value(buf, hint->relnames[i]);
+			Assert(hint->relnames[i]->magic == PMAGIC);
+			quote_value(buf, hint->relnames[i]->name);
 		}
 	}
 	if (hint->rows_str != NULL)
@@ -1333,7 +1358,7 @@ ParallelHintDesc(ParallelHint *hint, StringInfo buf, bool nolf)
 	appendStringInfo(buf, "%s(", hint->base.keyword);
 	if (hint->relname != NULL)
 	{
-		quote_value(buf, hint->relname);
+		quote_value(buf, hint->relname->name);
 
 		/* number of workers  */
 		appendStringInfoCharMacro(buf, ' ');
@@ -1432,23 +1457,54 @@ HintStateDump2(HintState *hstate)
 	pfree(buf.data);
 }
 
+#include "utils/formatting.h"
+
 /*
  * compare functions
  */
 
+/*
+ * XXX: It would be better to lookup the syscache and compare oids of both
+ * relations. But maybe such a lightweight design invented intentionally?
+ */
 static int
-RelnameCmp(const void *a, const void *b)
+RelnameCmpExt(const void *a, const ParsedName *pname, bool isrelname)
 {
 	const char *relnamea = *((const char **) a);
-	const char *relnameb = *((const char **) b);
+	int			result;
 
-	return strcmp(relnamea, relnameb);
+	Assert(pname->magic == PMAGIC);
+
+	if (!isrelname || pname->in_quote)
+		result = strcmp(relnamea, pname->name);
+	else
+	{
+		char   *value;
+
+		value = str_tolower(pname->name, strlen(pname->name), DEFAULT_COLLATION_OID);
+		result = strcmp(relnamea, value);
+//		elog(WARNING, "---> %s %s", relnamea, value);
+		pfree(value);
+	}
+
+	return result;
+}
+
+static int str_cmp(const void *a, const void *b)
+{
+	ParsedName *name1 = *((ParsedName **) a);
+	ParsedName *name2 = *((ParsedName **) b);
+
+	Assert(name1->magic == PMAGIC);
+	Assert(name2->magic == PMAGIC);
+
+	return strcmp(name1->name, name2->name);
 }
 
 static int
 ScanMethodHintCmp(const ScanMethodHint *a, const ScanMethodHint *b)
 {
-	return RelnameCmp(&a->relname, &b->relname);
+	return strcmp(a->relname->name, b->relname->name);
 }
 
 static int
@@ -1462,7 +1518,10 @@ JoinMethodHintCmp(const JoinMethodHint *a, const JoinMethodHint *b)
 	for (i = 0; i < a->nrels; i++)
 	{
 		int	result;
-		if ((result = RelnameCmp(&a->relnames[i], &b->relnames[i])) != 0)
+
+		Assert(a->relnames[i]->magic == PMAGIC);
+		Assert(b->relnames[i]->magic == PMAGIC);
+		if ((result = RelnameCmpExt(&a->relnames[i]->name, b->relnames[i], false)) != 0)
 			return result;
 	}
 
@@ -1492,7 +1551,11 @@ RowsHintCmp(const RowsHint *a, const RowsHint *b)
 	for (i = 0; i < a->nrels; i++)
 	{
 		int	result;
-		if ((result = RelnameCmp(&a->relnames[i], &b->relnames[i])) != 0)
+
+		Assert(a->relnames[i]->magic == PMAGIC);
+		Assert(b->relnames[i]->magic == PMAGIC);
+
+		if ((result = RelnameCmpExt(&a->relnames[i]->name, b->relnames[i], false)) != 0)
 			return result;
 	}
 
@@ -1502,7 +1565,7 @@ RowsHintCmp(const RowsHint *a, const RowsHint *b)
 static int
 ParallelHintCmp(const ParallelHint *a, const ParallelHint *b)
 {
-	return RelnameCmp(&a->relname, &b->relname);
+	return strcmp(a->relname->name, b->relname->name);
 }
 
 static int
@@ -1580,10 +1643,9 @@ skip_parenthesis(const char *str, char parenthesis)
  * Parsed token is truncated within NAMEDATALEN-1 bytes, when truncate is true.
  */
 static const char *
-parse_quoted_value(const char *str, char **word, bool truncate)
+parse_quoted_value(const char *str, char **word, bool truncate, bool *in_quote)
 {
 	StringInfoData	buf;
-	bool			in_quote;
 
 	/* Skip leading spaces. */
 	skip_space(str);
@@ -1592,14 +1654,14 @@ parse_quoted_value(const char *str, char **word, bool truncate)
 	if (*str == '"')
 	{
 		str++;
-		in_quote = true;
+		*in_quote = true;
 	}
 	else
-		in_quote = false;
+		*in_quote = false;
 
 	while (true)
 	{
-		if (in_quote)
+		if (*in_quote)
 		{
 			/* Double quotation must be closed. */
 			if (*str == '\0')
@@ -1652,7 +1714,7 @@ parse_quoted_value(const char *str, char **word, bool truncate)
 }
 
 static OuterInnerRels *
-OuterInnerRelsCreate(char *name, List *outer_inner_list)
+OuterInnerRelsCreate(ParsedName *name, List *outer_inner_list)
 {
 	OuterInnerRels *outer_inner;
 
@@ -1686,12 +1748,15 @@ parse_parentheses_Leading_in(const char *str, OuterInnerRels **outer_inner)
 		}
 		else
 		{
-			char   *name;
+			ParsedName   *pname = palloc0(sizeof(ParsedName));
 
-			if ((str = parse_quoted_value(str, &name, true)) == NULL)
+			pname->magic = PMAGIC;
+
+			if ((str = parse_quoted_value(str, &pname->name, true,
+										  &pname->in_quote)) == NULL)
 				break;
 			else
-				outer_inner_rels = OuterInnerRelsCreate(name, NIL);
+				outer_inner_rels = OuterInnerRelsCreate(pname, NIL);
 		}
 
 		outer_inner_pair = lappend(outer_inner_pair, outer_inner_rels);
@@ -1714,7 +1779,6 @@ static const char *
 parse_parentheses_Leading(const char *str, List **name_list,
 	OuterInnerRels **outer_inner)
 {
-	char   *name;
 	bool	truncate = true;
 
 	if ((str = skip_parenthesis(str, '(')) == NULL)
@@ -1731,13 +1795,17 @@ parse_parentheses_Leading(const char *str, List **name_list,
 		/* Store words in parentheses into name_list. */
 		while(*str != ')' && *str != '\0')
 		{
-			if ((str = parse_quoted_value(str, &name, truncate)) == NULL)
+			ParsedName   *pname = palloc0(sizeof(ParsedName));
+
+			pname->magic = PMAGIC;
+
+			if ((str = parse_quoted_value(str, &pname->name, truncate, &pname->in_quote)) == NULL)
 			{
 				list_free(*name_list);
 				return NULL;
 			}
 
-			*name_list = lappend(*name_list, name);
+			*name_list = lappend(*name_list, pname);
 			skip_space(str);
 		}
 	}
@@ -1750,7 +1818,6 @@ parse_parentheses_Leading(const char *str, List **name_list,
 static const char *
 parse_parentheses(const char *str, List **name_list, HintKeyword keyword)
 {
-	char   *name;
 	bool	truncate = true;
 
 	if ((str = skip_parenthesis(str, '(')) == NULL)
@@ -1761,13 +1828,18 @@ parse_parentheses(const char *str, List **name_list, HintKeyword keyword)
 	/* Store words in parentheses into name_list. */
 	while(*str != ')' && *str != '\0')
 	{
-		if ((str = parse_quoted_value(str, &name, truncate)) == NULL)
+		ParsedName   *pname = palloc0(sizeof(ParsedName));
+
+		pname->magic = PMAGIC;
+
+		if ((str = parse_quoted_value(str, &pname->name, truncate,
+									  &pname->in_quote)) == NULL)
 		{
 			list_free(*name_list);
 			return NULL;
 		}
 
-		*name_list = lappend(*name_list, name);
+		*name_list = lappend(*name_list, pname);
 		skip_space(str);
 
 		if (keyword == HINT_KEYWORD_INDEXSCANREGEXP ||
@@ -2097,7 +2169,8 @@ ScanMethodHintParse(ScanMethodHint *hint, const char *str)
 		return str;
 	}
 
-	hint->relname = linitial(name_list);
+	hint->relname = (ParsedName *) linitial(name_list);
+	Assert(hint->relname->magic == PMAGIC);
 	hint->indexnames = list_delete_first(name_list);
 
 	/* check whether the hint accepts index name(s) */
@@ -2185,15 +2258,16 @@ JoinMethodHintParse(JoinMethodHint *hint, const char *str)
 		 * Transform relation names from list to array to sort them with qsort
 		 * after.
 		 */
-		hint->relnames = palloc0(sizeof(char *) * hint->nrels);
+		hint->relnames = palloc0(sizeof(ParsedName *) * hint->nrels);
 		foreach (l, name_list)
 		{
 			hint->relnames[i] = lfirst(l);
+			Assert(hint->relnames[i]->magic == PMAGIC);
 			i++;
 		}
 	}
 
-	list_free(name_list);
+//	list_free(name_list);
 
 	/* A join hint requires at least two relations */
 	if (hint->nrels < 2)
@@ -2206,7 +2280,7 @@ JoinMethodHintParse(JoinMethodHint *hint, const char *str)
 	}
 
 	/* Sort hints in alphabetical order of relation names. */
-	qsort(hint->relnames, hint->nrels, sizeof(char *), RelnameCmp);
+	qsort(hint->relnames, hint->nrels, sizeof(ParsedName *), str_cmp);
 
 	switch (hint_keyword)
 	{
@@ -2338,8 +2412,8 @@ SetHintParse(SetHint *hint, const char *str)
 	/* We need both name and value to set GUC parameter. */
 	if (list_length(name_list) == 2)
 	{
-		hint->name = linitial(name_list);
-		hint->value = lsecond(name_list);
+		hint->name = _relname(linitial(name_list));
+		hint->value = _relname(lsecond(name_list));
 	}
 	else
 	{
@@ -2383,17 +2457,19 @@ RowsHintParse(RowsHint *hint, const char *str)
 	 * Transform relation names from list to array to sort them with qsort
 	 * after.
 	 */
-	hint->relnames = palloc0(sizeof(char *) * hint->nrels);
+	hint->relnames = palloc0(sizeof(ParsedName *) * hint->nrels);
 	foreach (l, name_list)
 	{
 		if (hint->nrels <= i)
 			break;
+
 		hint->relnames[i] = lfirst(l);
+		Assert(hint->relnames[i]->magic == PMAGIC);
 		i++;
 	}
 
 	/* Retieve rows estimation */
-	rows_str = list_nth(name_list, hint->nrels);
+	rows_str = ((ParsedName *) list_nth(name_list, hint->nrels))->name;
 	hint->rows_str = rows_str;		/* store as-is for error logging */
 	if (rows_str[0] == '#')
 	{
@@ -2444,7 +2520,7 @@ RowsHintParse(RowsHint *hint, const char *str)
 	list_free(name_list);
 
 	/* Sort relnames in alphabetical order. */
-	qsort(hint->relnames, hint->nrels, sizeof(char *), RelnameCmp);
+	qsort(hint->relnames, hint->nrels, sizeof(ParsedName *), str_cmp);
 
 	return str;
 }
@@ -2474,10 +2550,11 @@ ParallelHintParse(ParallelHint *hint, const char *str)
 		return str;
 	}
 
-	hint->relname = linitial(name_list);
+	hint->relname = (ParsedName *) linitial(name_list);
+	Assert(hint->relname->magic == PMAGIC);
 
 	/* The second parameter is number of workers */
-	hint->nworkers_str = list_nth(name_list, 1);
+	hint->nworkers_str = ((ParsedName *) list_nth(name_list, 1))->name;
 	nworkers = strtod(hint->nworkers_str, &end_ptr);
 	if (*end_ptr || nworkers < 0 || nworkers > max_worker_processes)
 	{
@@ -2502,7 +2579,7 @@ ParallelHintParse(ParallelHint *hint, const char *str)
 	/* optional third parameter is specified */
 	if (length == 3)
 	{
-		const char *modeparam = (const char *)list_nth(name_list, 2);
+		const char *modeparam = (const char *)(((ParsedName *) list_nth(name_list, 2))->name);
 		if (pg_strcasecmp(modeparam, "hard") == 0)
 			force_parallel = true;
 		else if (pg_strcasecmp(modeparam, "soft") != 0)
@@ -3252,7 +3329,8 @@ find_scan_hint(PlannerInfo *root, Index relid)
 			continue;
 
 		if (!alias_hint &&
-			RelnameCmp(&rte->eref->aliasname, &hint->relname) == 0)
+			RelnameCmpExt(&rte->eref->aliasname, hint->relname,
+						rte->rtekind == RTE_RELATION) == 0)
 			alias_hint = hint;
 
 		/* check the real name for appendrel children */
@@ -3261,7 +3339,8 @@ find_scan_hint(PlannerInfo *root, Index relid)
 		{
 			char *realname = get_rel_name(rte->relid);
 
-			if (realname && RelnameCmp(&realname, &hint->relname) == 0)
+			if (realname && RelnameCmpExt(&realname, hint->relname,
+										rte->rtekind == RTE_RELATION) == 0)
 				real_name_hint = hint;
 		}
 
@@ -3319,8 +3398,8 @@ find_parallel_hint(PlannerInfo *root, Index relid)
 		if (!hint_state_enabled(hint))
 			continue;
 
-		if (!alias_hint &&
-			RelnameCmp(&rte->eref->aliasname, &hint->relname) == 0)
+		if (!alias_hint && RelnameCmpExt(&rte->eref->aliasname, hint->relname,
+									   rte->rtekind == RTE_RELATION) == 0)
 			alias_hint = hint;
 
 		/* check the real name for appendrel children */
@@ -3329,7 +3408,8 @@ find_parallel_hint(PlannerInfo *root, Index relid)
 		{
 			char *realname = get_rel_name(rte->relid);
 
-			if (realname && RelnameCmp(&realname, &hint->relname) == 0)
+			if (realname && RelnameCmpExt(&realname, hint->relname,
+									   rte->rtekind == RTE_RELATION) == 0)
 				real_name_hint = hint;
 		}
 
@@ -3431,13 +3511,15 @@ restrict_indexes(PlannerInfo *root, ScanMethodHint *hint, RelOptInfo *rel,
 
 		foreach(l, hint->indexnames)
 		{
-			char   *hintname = (char *) lfirst(l);
-			bool	result;
+			ParsedName *hintname = (ParsedName *) lfirst(l);
+			bool		result;
+
+			Assert(hintname->magic == PMAGIC);
 
 			if (hint->regexp)
-				result = regexpeq(indexname, hintname);
+				result = regexpeq(indexname, hintname->name);
 			else
-				result = RelnameCmp(&indexname, &hintname) == 0;
+				result = RelnameCmpExt(&indexname, hintname, true) == 0;
 
 			if (result)
 			{
@@ -3659,7 +3741,7 @@ restrict_indexes(PlannerInfo *root, ScanMethodHint *hint, RelOptInfo *rel,
 		if (using_parent_hint)
 			disprelname = get_rel_name(rte->relid);
 		else
-			disprelname = hint->relname;
+			disprelname = hint->relname->name;
 
 
 		initStringInfo(&rel_buf);
@@ -3886,7 +3968,10 @@ setup_hint_enforcement(PlannerInfo *root, RelOptInfo *rel,
 
 					foreach(lc, pshint->indexnames)
 					{
-						if (RelnameCmp(&indexname, &lfirst(lc)) == 0)
+						ParsedName *pname = (ParsedName *) lfirst(lc);
+
+						Assert(pname->magic == PMAGIC);
+						if (RelnameCmpExt(&indexname, pname, true) == 0)
 							break;
 					}
 					if (!lc)
@@ -3992,7 +4077,7 @@ setup_hint_enforcement(PlannerInfo *root, RelOptInfo *rel,
  * If same aliasname was used multiple times in a query, return -1.
  */
 static int
-find_relid_aliasname(PlannerInfo *root, char *aliasname, List *initial_rels,
+find_relid_aliasname(PlannerInfo *root, ParsedName *pname, List *initial_rels,
 					 const char *str)
 {
 	int		i;
@@ -4001,14 +4086,15 @@ find_relid_aliasname(PlannerInfo *root, char *aliasname, List *initial_rels,
 	for (i = 1; i < root->simple_rel_array_size; i++)
 	{
 		ListCell   *l;
+		RangeTblEntry *rte;
 
 		if (root->simple_rel_array[i] == NULL)
 			continue;
 
 		Assert(i == root->simple_rel_array[i]->relid);
 
-		if (RelnameCmp(&aliasname,
-					   &root->simple_rte_array[i]->eref->aliasname) != 0)
+		rte = root->simple_rte_array[i];
+		if (RelnameCmpExt(&rte->eref->aliasname, pname, rte->rtekind == RTE_RELATION) != 0)
 			continue;
 
 		foreach(l, initial_rels)
@@ -4032,7 +4118,7 @@ find_relid_aliasname(PlannerInfo *root, char *aliasname, List *initial_rels,
 			{
 				hint_ereport(str,
 							 ("Relation name \"%s\" is ambiguous.",
-							  aliasname));
+							  pname->name));
 				return -1;
 			}
 
@@ -4173,18 +4259,18 @@ OuterInnerJoinCreate(OuterInnerRels *outer_inner, LeadingHint *leading_hint,
 
 static Relids
 create_bms_of_relids(Hint *base, PlannerInfo *root, List *initial_rels,
-		int nrels, char **relnames)
+		int nrels, ParsedName **relnames)
 {
 	int		relid;
 	Relids	relids = NULL;
 	int		j;
-	char   *relname;
+	ParsedName   *pname;
 
 	for (j = 0; j < nrels; j++)
 	{
-		relname = relnames[j];
+		pname = relnames[j];
 
-		relid = find_relid_aliasname(root, relname, initial_rels,
+		relid = find_relid_aliasname(root, pname, initial_rels,
 									 base->hint_str);
 
 		if (relid == -1)
@@ -4202,7 +4288,7 @@ create_bms_of_relids(Hint *base, PlannerInfo *root, List *initial_rels,
 		if (bms_is_member(relid, relids))
 		{
 			hint_ereport(base->hint_str,
-						 ("Relation name \"%s\" is duplicated.", relname));
+						 ("Relation name \"%s\" is duplicated.", pname->name));
 			base->state = HINT_STATE_ERROR;
 			break;
 		}
@@ -4228,7 +4314,7 @@ transform_join_hints(HintState *hstate, PlannerInfo *root, int nbaserel,
 	Relids			joinrelids;
 	int				njoinrels;
 	ListCell	   *l;
-	char		   *relname;
+	ParsedName	   *pname;
 	LeadingHint	   *lhint = NULL;
 
 	/*
@@ -4305,9 +4391,9 @@ transform_join_hints(HintState *hstate, PlannerInfo *root, int nbaserel,
 
 		foreach(l, leading_hint->relations)
 		{
-			relname = (char *)lfirst(l);;
+			pname = (ParsedName *) lfirst(l);
 
-			relid = find_relid_aliasname(root, relname, initial_rels,
+			relid = find_relid_aliasname(root, pname, initial_rels,
 										 leading_hint->base.hint_str);
 			if (relid == -1)
 				leading_hint->base.state = HINT_STATE_ERROR;
@@ -4318,7 +4404,7 @@ transform_join_hints(HintState *hstate, PlannerInfo *root, int nbaserel,
 			if (bms_is_member(relid, relids))
 			{
 				hint_ereport(leading_hint->base.hint_str,
-							 ("Relation name \"%s\" is duplicated.", relname));
+							 ("Relation name \"%s\" is duplicated.", pname->name));
 				leading_hint->base.state = HINT_STATE_ERROR;
 				break;
 			}
@@ -4362,14 +4448,14 @@ transform_join_hints(HintState *hstate, PlannerInfo *root, int nbaserel,
 		{
 			JoinMethodHint *hint;
 
-			relname = (char *)lfirst(l);
+			pname = (ParsedName *) lfirst(l);
 
 			/*
 			 * Find relid of the relation which has given name.  If we have the
 			 * name given in Leading hint multiple times in the join, nothing to
 			 * do.
 			 */
-			relid = find_relid_aliasname(root, relname, initial_rels,
+			relid = find_relid_aliasname(root, pname, initial_rels,
 										 hstate->hint_str);
 
 			/* Create bitmap of relids for current join level. */
